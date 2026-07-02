@@ -1,0 +1,17 @@
+{
+  "name": "rspack-inline-const-panic-repro",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "rspack build"
+  },
+  "devDependencies": {
+    "@rspack/cli": "^2.1.2",
+    "@rspack/core": "^2.1.2",
+    "@swc/core": "^1.7.0",
+    "swc-loader": "^0.2.6"
+  }
+}

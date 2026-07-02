@@ -1,0 +1,1 @@
+{ "name": "@repro/styling", "version": "1.0.0", "sideEffects": false, "main": "index.ts", "module": "index.ts" }
