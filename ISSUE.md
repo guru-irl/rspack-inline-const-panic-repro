@@ -1,151 +1,129 @@
-# [Bug]: `should have module id` panic with module concatenation + inline-const (regression in 2.1.0)
+# [Bug]: `should have module id` panic with scope hoisting + inline-const (regression in 2.1.0)
 
 ## System Info
 
-- **rspack**: first broken **2.1.0**, still broken **2.1.2**; last good **2.0.1**
-- **optimization**: production defaults — `usedExports`, `sideEffects`, `concatenateModules`,
-  `innerGraph`, `inlineExports`, and `experiments.pureFunctions` all enabled (all default
-  to `true`/production)
-- Reproduces on Linux x64; not platform specific
-
-## Summary
-
-A production build panics during module-concatenation code generation:
-
 ```
-thread 'tokio-*' panicked at .../crates/rspack_core/src/concatenated_module.rs:
-should have module id
+  System:
+    OS: Linux Ubuntu 24.04.1 LTS
+    CPU: (24) x64 AMD Ryzen 9 3900X 12-Core Processor
+  Binaries:
+    Node: 22.18.0
+    npm: 10.9.3
+  npmPackages:
+    @rspack/cli: 2.1.2
+    @rspack/core: 2.1.2
 ```
 
-A **`sideEffects: false` package that exports a plain `function makeStyles`** (the real
-trigger is [`@griffel/react`](https://github.com/microsoft/griffel), consumed by
-Fluent UI) makes rspack attach an **impure deferred pure-check** to short numeric
-`const` imports that feed a `makeStyles(...)` call. In 2.1 those consts are **inlined to
-zero chunks** by inline-const, but the concatenation pass still marks the (cloned) import
-connection **active** and emits an external `__webpack_require__(<module id>)` to a module
-that no longer lives in any chunk → `get_module_id(...).expect("should have module id")`
-→ panic.
-
-A self-contained reproduction is in this repository (`npm install && npm run build`).
+Regression range: broke in **2.1.0**, still broken in **2.1.2**, last good version is **2.0.1**.
 
 ## Reproduction
 
+Minimal repro (no framework, ~10 tiny files): https://github.com/guru-irl/rspack-inline-const-panic-repro
+
 ```bash
+git clone https://github.com/guru-irl/rspack-inline-const-panic-repro
+cd rspack-inline-const-panic-repro
 npm install
-npm run build          # @rspack/core 2.1.2 -> PANIC: "should have module id"
+npm run build     # panics: "should have module id"
 
-# prove it is a 2.1 regression:
+# confirm it's a 2.1 regression:
 npm install @rspack/core@2.0.1 @rspack/cli@2.0.1
-npm run build          # -> compiles successfully
+npm run build     # builds fine
 ```
 
-Graph shape:
+## What happens
+
+A production build panics during scope-hoisting codegen:
 
 ```
-src/app.ts
-  ├─ import("components/AiHub")           (async chunk)
-  │     └─ AiHub() → Inner()              (Inner is concatenated INTO AiHub)
-  │            └─ const useInnerStyles = makeStyles({ maxWidth: SEARCH_BOX_MAX_WIDTH, ... })
-  └─ import("components/HomePage.styles") (async chunk, second consumer of the consts)
-
-constants/stylingConstants.ts
-        export const SEARCH_BOX_MAX_WIDTH = 731;   // short numeric consts,
-        export const SIDE_PANE_WIDTH      = 400;   // inline-const eligible
-        ...
-
-styling  (package.json: "sideEffects": false)      // mirrors @griffel/react
-        makeStyles.ts  -> plain `function makeStyles(...)`  (NO /*#__NO_SIDE_EFFECTS__*/)
-                          imports a side-effectful sibling module
+thread 'tokio-*' panicked at crates/rspack_core/src/concatenated_module.rs:
+should have module id
 ```
 
-## Root cause
+I originally hit this on a couple of large apps that use Fluent UI, and the module that
+panics is always a tiny `sideEffects: false` file that only exports numeric constants like
+`export const SEARCH_BOX_MAX_WIDTH = 731`. After a lot of digging it turned out the trigger
+is the combination of `@griffel/react`'s `makeStyles` (which Fluent UI re-exports) and the
+new inline-const optimization. The repo above reproduces it with a ~15-line stand-in for
+griffel so you don't need Fluent UI to see it.
 
-Three 2.1 behaviors combine. Each is individually correct; together they are inconsistent.
+## Why it happens
 
-### 1. inline-const drops the const module to zero chunks
+Three things have to line up. Individually they're all fine; together they contradict each
+other.
 
-`optimization.inlineExports` (production default, new in 2.1) inlines the short numeric
-`const`s at every use site. Nothing references `stylingConstants` at runtime, so the
-side-effect-free module is dropped from every chunk (`n_chunks == 0`).
+**1. inline-const removes the constants module entirely.** In 2.1 the short numeric consts
+get inlined into every consumer (`optimization.inlineExports`, on by default in
+production). Once that happens nothing imports the constants module at runtime, so it's
+dropped from every chunk and ends up with `n_chunks == 0`.
 
-> Note: this requires the loader to emit real `const` (e.g. swc-loader `jsc.target:
-> "esnext"`). A downleveled target rewrites `const`→`var`, disables inline-const, and
-> hides the bug.
+(This only kicks in if the loader actually emits `const` — with swc-loader you need
+`jsc.target: "esnext"`. A downleveled target turns `const` into `var`, inline-const bails,
+and the bug hides. That cost me a while to figure out.)
 
-### 2. A `sideEffects:false` package produces an *impure* deferred pure-check
+**2. A `sideEffects: false` package attaches an *impure* deferred pure-check to the const
+imports.** Because griffel is `sideEffects: false`, the consumer treats `makeStyles` as a
+side-effects-free deferred callee, and each const that feeds a `makeStyles({...})` call
+picks up a deferred pure-check.
 
-Because the styling package is `sideEffects: false`, the consumer marks its imported
-`makeStyles` as a **side-effects-free deferred callee**, which attaches a deferred
-pure-check to each `const` import that feeds a `makeStyles(...)` call.
+The impurity check is where it goes wrong. `deferred_pure_check_is_impure` in
+`crates/rspack_plugin_javascript/src/parser_plugin/inner_graph/mod.rs` resolves the target
+export and asks `module_has_side_effects_free_export`, which reads the target module's
+*per-export* `build_info().side_effects_free` set. That set is only ever populated by
+`/*#__NO_SIDE_EFFECTS__*/` annotations or numeric consts — package-level
+`"sideEffects": false` doesn't touch it. So for a plain `function makeStyles` in a
+`sideEffects: false` package the lookup returns `None`, the function falls through to its
+final `return true`, and the check comes back **impure**.
 
-The impurity test then disagrees with itself:
+That's exactly griffel's shape: `makeStyles.esm.js` is a plain `function makeStyles(...)`
+with no `/*#__NO_SIDE_EFFECTS__*/`, re-exported through the package barrel, in a
+`"sideEffects": false` package.
 
-`deferred_pure_check_is_impure`
-(`crates/rspack_plugin_javascript/src/parser_plugin/inner_graph/mod.rs`) resolves the
-target export and calls `module_has_side_effects_free_export`, which reads the target
-module's **per-export** `build_info().side_effects_free` set. **Package-level
-`sideEffects: false` never populates that per-export set** (only
-`/*#__NO_SIDE_EFFECTS__*/` annotations and numeric consts do). For a plain
-`function makeStyles` in a `sideEffects:false` package the set is `None`, so the function
-falls through to its final `return true` → **impure**.
-
-This is exactly `@griffel/react`'s shape: `makeStyles.esm.js` is a plain
-`function makeStyles(...)` (no `/*#__NO_SIDE_EFFECTS__*/`), re-exported through the
-package barrel, in a `"sideEffects": false` package.
-
-### 3. Concatenation marks the inlined connection active
-
-`Inner` (which owns the `const … = makeStyles(...)` statement) is concatenated into the
-async root `AiHub`. Concatenation **clones** `Inner`'s const import dependency. In the
-concatenated context, `connection_active_for_esm_import_specifier`
+**3. Scope hoisting then trusts that stale "active" answer.** The module that owns the
+`const x = makeStyles(...)` call gets concatenated into its only importer, which clones the
+const import dependency. In the concatenated context,
+`connection_active_for_esm_import_specifier`
 (`crates/rspack_plugin_javascript/src/dependency/esm/esm_import_specifier_dependency.rs`)
-short-circuits on the deferred pure-check **before** it checks whether the export was
-inlined:
+checks the deferred pure-check *before* it checks whether the export was inlined:
 
 ```rust
 if let Some(used_by_exports) = dependency.used_by_exports.as_ref() {
   if has_impure_deferred_pure_checks(module_graph, exports_info_artifact, used_by_exports) {
-    return true;                      // <-- reported active, ignoring inlining
+    return true;                      // reports active, never looks at inlining
   }
   if used_by_exports.is_false_without_deferred_pure_checks() { return false; }
 }
 let active_by_used_exports = /* ... */;
 active_by_used_exports
-  && connection_active_inline_value_for_esm_import_specifier(/* ... */) // inline check LAST
+  && connection_active_inline_value_for_esm_import_specifier(/* ... */) // inline check is last
 ```
 
-So the connection is reported active even though the value was inlined. Concatenation
-(`get_imports` / `get_concatenated_imports`) then treats it as a live external import and
-emits `__webpack_require__(<module id>)` for a module inlining already removed from every
-chunk → the module has no id → `expect("should have module id")` → **panic**.
+So the connection is reported active even though the value was already inlined.
+Concatenation then emits an external `__webpack_require__(<module id>)` for a module that
+inline-const removed from every chunk. There's no id → `expect("should have module id")` →
+panic.
 
-### Why the known workarounds avoid it
-
-- `concatenateModules: false` — no external `require()` is emitted.
-- `usedExports: false` — no inline-const, so the module is kept in a chunk.
-- A scoped `sideEffects` annotation on the constants module — changes module inclusion so
-  the const is not dropped to zero chunks.
+This also lines up with the known workarounds — each one breaks one of the three legs:
+`concatenateModules: false` (no external require emitted), `usedExports: false` (no
+inline-const, module stays in a chunk), or a scoped `sideEffects` entry on the constants
+file (module isn't dropped).
 
 ## Suggested fix
 
-Evaluate the **inline-value check first** in `connection_active_for_esm_import_specifier`
-and return `false` (inactive) when the referenced export is inlined, **before** the
-`used_by_exports` / `has_impure_deferred_pure_checks` short-circuit. When the value is
-inlined, the connection needs no runtime module reference and must be inactive, regardless
-of deferred pure-checks. Side effects are tracked by a separate side-effect import
-dependency, not the specifier dependency, so they are unaffected. Only the
-`inlined && has_impure_deferred_pure_checks` case changes (active → inactive); every other
-case is unchanged.
+Do the inline-value check first. If the referenced export was inlined, the connection
+doesn't need a runtime module reference and should be inactive regardless of the deferred
+pure-checks — so return `false` before the `has_impure_deferred_pure_checks` short-circuit.
+Side effects ride on a separate side-effect import dependency, not the specifier
+dependency, so nothing about side-effect ordering changes. Only the
+`inlined && impure-deferred-check` case flips (active → inactive); everything else stays
+the same.
 
-Branch: https://github.com/guru-irl/rspack/tree/fix/inline-const-concat-active-panic
+I have a patch here: https://github.com/guru-irl/rspack/tree/fix/inline-const-concat-active-panic
 
-## Verification
+With it applied:
 
-- The reproduction in this repo: panics on 2.1.0–2.1.2, builds cleanly on 2.0.1, and
-  builds cleanly with the patched binding.
-- Reproduced independently on two large production apps; both build cleanly with the
-  patched binding and the `sideEffects` workaround removed.
-- rspack test suite against the patched release binding:
-  - `TreeShaking.test.js` — **84 passed**
-  - `configCases/inline-const/*` — **24 passed**
-  - `configCases/concatenate-modules/*` — **48 passed**
+- the repo above builds on 2.1.2,
+- the two production apps build with their `sideEffects` workaround removed,
+- and the existing suites still pass — `TreeShaking.test.js` (84), `configCases/inline-const` (24), `configCases/concatenate-modules` (48).
+
+Happy to turn the repro into a `configCases` fixture and open a PR if that's useful.
